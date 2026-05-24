@@ -1,0 +1,215 @@
+name: Resident Evil 4 iOS Architecture Recovery & Study
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  resident-evil-analysis:
+    runs-on: macos-latest
+
+    steps:
+    # ১. রিপোজিটরি চেকআউট
+    - name: Checkout Code Base
+      uses: actions/checkout@v4
+
+    # ২. প্রয়োজনীয় এনভায়রনমেন্ট ও টুলস সেটআপ (PEP 668 Error Fixed)
+    - name: Setup Multi-Tool Reverse Engineering Environment
+      run: |
+        echo "=================================================="
+        echo "🚀 Installing Advanced Reverse Engineering Toolchain..."
+        echo "=================================================="
+        
+        # Homebrew এর মাধ্যমে Radare2, JQ, Wget ইনস্টল
+        brew install radare2 jq wget pipx
+        
+        # dsdump ইনস্টল করা (Modern class-dump যা Swift 5+ এবং মেথড সিগনেচার ডাম্প সাপোর্ট করে)
+        brew tap derekselander/funpack
+        brew install dsdump
+
+        # পাইথন এক্সটার্নাল এনভায়রনমেন্ট এরর ফিক্স করে Frida ইনস্টল করা
+        echo "📦 Installing Frida via Python with system bypass..."
+        python3 -m pip install --upgrade pip --break-system-packages
+        pip3 install frida-tools --break-system-packages
+
+        # এনভায়রনমেন্ট ভেরিফিকেশন লগ
+        echo "--- Tool Versions Verification ---"
+        frida --version || echo "⚠️ Frida setup error"
+        r2 -v || echo "⚠️ Radare2 setup error"
+        dsdump --version || echo "⚠️ dsdump setup error"
+
+    # ৩. টার্গেট RE4 IPA ফাইল ডাউনলোড
+    - name: Fetch and Verify Resident Evil 4 IPA
+      run: |
+        # Resident Evil 4 v1.0.5 এর জন্য নির্দিষ্ট ইউআরএল এবং নাম ফিক্সড করা হয়েছে
+        IPA_URL="https://dl.iosvizor.net/resident-evil-4/resident-evil-4-v1.0.5-iosvizor.ipa"
+        APP_NAME="Resident-Evil-4"
+        
+        echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+        
+        echo "📥 Downloading Resident Evil 4 Asset from: $IPA_URL"
+        # বড় গেম ফাইল ডাউনলোডের জন্য ম্যাক্স টাইম বাড়িয়ে ১২০০ সেকেন্ড (২০ মিনিট) করা হয়েছে
+        curl -L "$IPA_URL" -o "${APP_NAME}.ipa" --progress-bar --max-time 1200
+        
+        if [ ! -f "${APP_NAME}.ipa" ]; then
+          echo "❌ CRITICAL ERROR: RE4 Application download failed."
+          exit 1
+        fi
+        ls -lh "${APP_NAME}.ipa"
+
+    # ৪. IPA ডিকম্প্রেশন এবং স্ট্রাকচার এক্সট্রাকশন
+    - name: Unpack IPA and Map Directory Structure
+      run: |
+        mkdir -p workspace/extracted_workspace
+        cd workspace
+        
+        echo "📦 Unzipping Resident Evil 4 IPA Archive..."
+        unzip -q "../${{ env.APP_NAME }}.ipa" -d extracted_workspace/ || true
+        
+        cd extracted_workspace
+        APP_PATH=$(find Payload -maxdepth 2 -name "*.app" -type d | head -n 1)
+        echo "APP_PATH=$APP_PATH" >> $GITHUB_ENV
+        echo "$APP_PATH" > app_target_path.txt
+        
+        echo "📋 Mapping complete file tree for Integrity and DMCA/Asset Audit..."
+        find Payload -type f -exec ls -lh {} \; > integrity_file_structure.txt
+
+    # ৫. বাইনারি আইডেন্টিফিকেশন এবং এনক্রিপশন চেক
+    - name: Binary Inspection & Decryption Status Check
+      run: |
+        cd workspace/extracted_workspace
+        APP_PATH=$(cat app_target_path.txt)
+        
+        # মূল এক্সিকিউটেবল বাইনারি খোঁজা
+        BINARY=$(find "$APP_PATH" -maxdepth 1 -type f ! -name "*.plist" -executable | head -n 1)
+        if [ -z "$BINARY" ]; then
+          BINARY=$(find "$APP_PATH" -maxdepth 1 -type f ! -name "*.plist" ! -name ".*" | head -n 1)
+        fi
+        
+        echo "BINARY_PATH=$BINARY" >> $GITHUB_ENV
+        echo "$BINARY" > binary_target_path.txt
+        
+        mkdir -p ../analysis_output/Static_Analysis
+        
+        echo "🔒 Checking LC_ENCRYPTION_INFO (App Store FairPlay Check)..."
+        otool -l "$BINARY" | grep -A5 "LC_ENCRYPTION" > ../analysis_output/Static_Analysis/encryption_metadata.txt || true
+        cat ../analysis_output/Static_Analysis/encryption_metadata.txt
+
+    # ৬. ক্লাস-ডাম্পিং এবং ইন্টারফেস পুনর্গঠন (Class-Dump & dsdump Phase)
+    - name: Reconstruct Objective-C & Swift Class Interfaces
+      run: |
+        cd workspace/extracted_workspace
+        BINARY=$(cat binary_target_path.txt)
+        mkdir -p ../analysis_output/Reconstructed_Headers
+        
+        echo "📂 Reconstructing Header Interfaces (Recreating .h skeleton)..."
+        
+        # Swift এবং Objective-C ক্লাস স্ট্রাকচার ডাম্পিং
+        dsdump --objc --verbose 3 "$BINARY" > ../analysis_output/Reconstructed_Headers/RE4_ObjC_Interfaces.h 2>/dev/null || true
+        dsdump --swift --verbose 3 "$BINARY" > ../analysis_output/Reconstructed_Headers/RE4_Swift_Interfaces.swift 2>/dev/null || true
+        
+        # মেথড এবং প্রোপার্টি সিগনেচার এনালাইসিস
+        dsdump --as-proto "$BINARY" > ../analysis_output/Reconstructed_Headers/RE4_App_Protocols.txt 2>/dev/null || true
+        
+        echo "✅ Header Skeleton Generation Attempt Complete."
+
+    # ৭. Radare2 এর মাধ্যমে অ্যাডভান্সড ডিসঅ্যাসেম্বলি এবং সিউডোকোড এনালাইসিস
+    - name: Advanced Disassembly & Pseudo-Code Analysis via Radare2
+      run: |
+        cd workspace/extracted_workspace
+        BINARY=$(cat binary_target_path.txt)
+        mkdir -p ../analysis_output/Radare2_Disassembly
+        
+        echo "🔬 Running Radare2 Static Analysis (Batch Mode)..."
+        # aa: অটো অ্যানালাইসিস (ফাংশন, সিম্বল ডিটেক্ট করা)
+        # afl: সমস্ত ফাংশনের লিস্ট তৈরি করা
+        # iz: ডেটা সেকশনের স্ট্রিং বা টেক্সট খোঁজা
+        
+        r2 -c "aa; afl" "$BINARY" > ../analysis_output/Radare2_Disassembly/detected_functions.txt 2>/dev/null || true
+        r2 -c "aa; iz" "$BINARY" > ../analysis_output/Radare2_Disassembly/data_sections_strings.txt 2>/dev/null || true
+        
+        # গ্লোবাল এন্ট্রি পয়েন্ট ডিকম্পিলেশন ট্র্যাকিং
+        r2 -c "aa; pdf @ entry0" "$BINARY" > ../analysis_output/Radare2_Disassembly/entry0_decompiled.txt 2>/dev/null || true
+
+    # ৮. রিসোর্স, গেম কনফিগারেশন এবং স্ট্রিংস এক্সট্রাকশন
+    - name: Extract Project Assets, Plists, and Strings
+      run: |
+        cd workspace/extracted_workspace
+        APP_PATH=$(cat app_target_path.txt)
+        mkdir -p ../analysis_output/Assets_and_Configs
+        
+        echo "🎨 Extracting Assets, Configs, and Localization..."
+        find "$APP_PATH" -type f \( -name "*.plist" -o -name "*.json" -o -name "*.strings" \) -exec cp {} ../analysis_output/Assets_and_Configs/ \; 2>/dev/null || true
+        
+        # Info.plist কে মানুষের পড়ার উপযোগী ফরম্যাটে কনভার্ট করা
+        if [ -f "$APP_PATH/Info.plist" ]; then
+          plutil -p "$APP_PATH/Info.plist" > ../analysis_output/Assets_and_Configs/Info_parsed.json 2>/dev/null || true
+        fi
+
+    # ৯. ফ্রাইডা (Frida) স্ট্যাটিক হুকিং স্ক্রিপ্ট জেনারেশন
+    - name: Generate Frida Instrumentation Scripts for Runtime Analysis
+      run: |
+        mkdir -p workspace/analysis_output/Frida_Hooks
+        
+        echo "✍️ Generating Frida boilerplate hooks based on standard iOS behaviors..."
+        cat > workspace/analysis_output/Frida_Hooks/re4_logger.js << 'EOF'
+        /* Frida Hook Script generated automatically for Resident Evil 4 Analysis */
+        if (ObjC.available) {
+            try {
+                // Hooking standard String initialization to intercept internal logic
+                var NSString = ObjC.classes.NSString;
+                Interceptor.attach(NSString["+ stringWithUTF8String:"].implementation, {
+                    onEnter: function (args) {
+                        var str = Memory.readUtf8String(args[2]);
+                        console.log("[RE4 Intercepted String]: " + str);
+                    }
+                });
+            } catch (err) {
+                console.log("Exception in Hooking: " + err.message);
+            }
+        } else {
+            console.log("Objective-C Runtime is not available.");
+        }
+        EOF
+
+    # ১০. কমপ্লিট রান লগ এবং স্টাডি রিপোর্ট তৈরি
+    - name: Generate Deep Study Report
+      run: |
+        cd workspace/analysis_output
+        
+        cat > STUDY_REPORT.md << 'EOF'
+        # Resident Evil 4 iOS Reverse Engineering & Reconstructed Architecture Report
+        
+        ## এক্সিকিউশন সারসংক্ষেপ (Execution Summary)
+        - **স্টাডি টার্গেট:** Resident Evil 4 v1.0.5 (iOS)
+        - **তারিখ ও সময়:** $(date)
+        - **অ্যানালাইসিস টাইপ:** Static Disassembly & Pseudo-Source Reconstruction
+        
+        ## আর্কিটেকচার রিকভারি স্ট্যাটাস (Architecture Recovery Status)
+        EOF
+        
+        echo "### রিকভার করা ফাংশন সংখ্যা (Radare2):" >> STUDY_REPORT.md
+        if [ -f "Radare2_Disassembly/detected_functions.txt" ]; then
+          echo '```' >> STUDY_REPORT.md
+          wc -l < Radare2_Disassembly/detected_functions.txt >> STUDY_REPORT.md
+          echo '```' >> STUDY_REPORT.md
+        else
+          echo "No functions detected or binary encrypted." >> STUDY_REPORT.md
+        fi
+        
+        echo "### অবজেক্টিভ-সি ক্লাস ইন্টারফেস (কার্নেল কঙ্কাল):" >> STUDY_REPORT.md
+        if [ -f "Reconstructed_Headers/RE4_ObjC_Interfaces.h" ]; then
+          echo "পদ্ধতি: \`dsdump\` এর মাধ্যমে সফলভাবে ক্লাস এবং আইওএস ফ্রেমওয়ার্ক ইন্টারফেস জেনারেট করা হয়েছে।" >> STUDY_REPORT.md
+        fi
+
+    # ১১. সমস্ত ডাটা প্যাকেজিং এবং আর্টফ্যাক্ট আপলোড
+    - name: Package Core Output and Upload Artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: RE4-Reconstructed-Source-Study
+        path: |
+          workspace/analysis_output/
+        retention-days: 7
+        compression-level: 9
